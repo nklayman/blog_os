@@ -9,4 +9,5 @@ edition = "2018"
 uefi = "0.11"
 uefi-services = "*"
 log = { version = "*", default_features = false }
+cty = "*"
 # rlibc = "1"
