@@ -8,8 +8,10 @@ use core::panic::PanicInfo;
 
 #[no_mangle]
 pub extern "C" fn _start(fb_info: FramebufferInfo) -> ! {
+    // The bootloader passes in the fb_info struct when starting the kernel
+    // We use it to set the global framebuffer so that print! and println! work
     set_framebuffer(fb_info);
-    println!("Hello, {}", "name");
+    println!("Hello, {}", "World!");
 
     loop {}
 }
