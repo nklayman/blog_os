@@ -11,7 +11,7 @@ use uefi::proto::media::file::FileInfo;
 use uefi::proto::media::file::{File, FileAttribute, FileType::Regular};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::MemoryDescriptor;
-use uefi::{data_types::*, prelude::*, proto::loaded_image::LoadedImage};
+use uefi::{data_types::*, prelude::*};
 
 #[repr(C)]
 struct GopRes {
@@ -34,6 +34,37 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .expect_success("Failed to reset stdout");
     let bs = st.boot_services();
 
+    let (gop, gop_mode) = set_gop_mode(bs);
+    let kernel = load_kernel(bs);
+
+    unsafe {
+        info!("Copying Kernel...");
+        let kernel_entry = copy_kernel_segments(kernel);
+
+        let gop_info = GopInfo {
+            pointer: gop.frame_buffer().as_mut_ptr(),
+            size: (gop.frame_buffer().size() / 4) as u64,
+            resolution: GopRes {
+                x: gop_mode.info().resolution().0 as u64,
+                y: gop_mode.info().resolution().1 as u64,
+            },
+            stride: gop_mode.info().stride() as u64,
+        };
+
+        info!("Exiting boot services...");
+        let max_mmap_size = bs.memory_map_size() + 8 * mem::size_of::<MemoryDescriptor>();
+        let mut mmap_buf = vec![0; max_mmap_size].into_boxed_slice();
+        st.exit_boot_services(image, &mut mmap_buf)
+            .expect_success("Failed to exit boot services");
+
+        info!("Launching Kernel at {:X}", kernel_entry);
+        let entry_fn: extern "sysv64" fn(GopInfo) -> ! = mem::transmute(kernel_entry);
+        entry_fn(gop_info);
+    }
+}
+
+/// Sets the graphics output mode to 1600x900, with bgr pixel format
+fn set_gop_mode(bs: &BootServices) -> (&mut GraphicsOutput, Mode) {
     let gop_raw = bs.locate_protocol::<GraphicsOutput>().unwrap().unwrap();
     let gop = unsafe { gop_raw.get().as_mut().unwrap() };
     let gop_2 = unsafe { gop_raw.get().as_mut().unwrap() };
@@ -50,13 +81,12 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             break;
         }
     }
-    let gop_mode = gop_mode.unwrap();
-    let loaded_image = bs.handle_protocol::<LoadedImage>(image).unwrap().unwrap();
-    let loaded_image = unsafe { loaded_image.get().as_ref().unwrap() };
-    let fs = bs
-        .handle_protocol::<SimpleFileSystem>(loaded_image.device())
-        .unwrap()
-        .unwrap();
+    (gop, gop_mode.expect("Resolution not available"))
+}
+
+/// Loads kernel.elf from filesystem into vector of bytes and returns it
+fn load_kernel(bs: &BootServices) -> alloc::vec::Vec<u8> {
+    let fs = bs.locate_protocol::<SimpleFileSystem>().unwrap().unwrap();
     let fs = unsafe { fs.get().as_mut().unwrap() };
     let mut volume = fs.open_volume().unwrap().unwrap();
     let kernel_handle = volume
@@ -80,53 +110,41 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     } else {
         panic!("Kernel file is a directory");
     };
+    kernel
+}
 
-    info!("Copying Kernel...");
-    unsafe {
-        let entry = *(kernel.as_ptr().offset(0x18) as *const u64);
-        let program_headers_offset = *(kernel.as_ptr().offset(0x20) as *const u64);
-        let program_headers = kernel.as_ptr().add(program_headers_offset as usize);
-        let entry_size = *(kernel.as_ptr().offset(0x36) as *const u16);
-        let entry_count = *(kernel.as_ptr().offset(0x38) as *const u16);
-        info!("Entry size: {}, Entry count: {}", entry_size, entry_count);
-        for i in 0..entry_count {
-            let entry = program_headers.add((i * entry_size).into());
-            let segment_type = *(entry as *const u32);
-            info!("Segment type: {}", segment_type);
-            if segment_type == 1 {
-                let data_offset = *(entry.offset(0x8) as *const u64);
-                let mem_addr = *(entry.offset(0x10) as *const u64);
-                let size_file = *(entry.offset(0x20) as *const u64);
-                let size_mem = *(entry.offset(0x28) as *const u64);
-                info!(
-                    "Writing segment of size {:X} from {:X} to {:X}",
-                    size_mem, data_offset, mem_addr
-                );
-                ptr::write_bytes(mem_addr as *mut u8, 0, size_mem as usize);
-                ptr::copy(
-                    kernel.as_ptr().add(data_offset as usize),
-                    mem_addr as *mut u8,
-                    size_file as usize,
-                );
-            }
+// TODO: make sure that the kernel is written into unused memory,
+// however the only memory used should be for the kernel byte array which isn't needed
+// after this, so it _should_ be okay, maybe
+/// Copies all the program segments in the kernel elf file to their specified memory location
+/// and returns the kernel's entry point address
+unsafe fn copy_kernel_segments(kernel: alloc::vec::Vec<u8>) -> u64 {
+    let kernel_entry = *(kernel.as_ptr().offset(0x18) as *const u64);
+    let program_headers_offset = *(kernel.as_ptr().offset(0x20) as *const u64);
+    let program_headers = kernel.as_ptr().add(program_headers_offset as usize);
+    let entry_size = *(kernel.as_ptr().offset(0x36) as *const u16);
+    let entry_count = *(kernel.as_ptr().offset(0x38) as *const u16);
+    info!("Entry size: {}, Entry count: {}", entry_size, entry_count);
+    for i in 0..entry_count {
+        let entry = program_headers.add((i * entry_size).into());
+        let segment_type = *(entry as *const u32);
+        info!("Segment type: {}", segment_type);
+        if segment_type == 1 {
+            let data_offset = *(entry.offset(0x8) as *const u64);
+            let mem_addr = *(entry.offset(0x10) as *const u64);
+            let size_file = *(entry.offset(0x20) as *const u64);
+            let size_mem = *(entry.offset(0x28) as *const u64);
+            info!(
+                "Writing segment of size {:X} from {:X} to {:X}",
+                size_mem, data_offset, mem_addr
+            );
+            ptr::write_bytes(mem_addr as *mut u8, 0, size_mem as usize);
+            ptr::copy(
+                kernel.as_ptr().add(data_offset as usize),
+                mem_addr as *mut u8,
+                size_file as usize,
+            );
         }
-        info!("FB size: {}", gop.frame_buffer().size());
-        info!("Exiting boot services...");
-        let max_mmap_size =
-            st.boot_services().memory_map_size() + 8 * mem::size_of::<MemoryDescriptor>();
-        let mut mmap_buf = vec![0; max_mmap_size].into_boxed_slice();
-        st.exit_boot_services(image, &mut mmap_buf)
-            .expect_success("Failed to exit boot services");
-        info!("Launching Kernel at {:X}", entry);
-        let entry_fn: extern "sysv64" fn(GopInfo) -> ! = mem::transmute(entry);
-        entry_fn(GopInfo {
-            pointer: gop.frame_buffer().as_mut_ptr(),
-            size: (gop.frame_buffer().size() / 4) as u64,
-            resolution: GopRes {
-                x: gop_mode.info().resolution().0 as u64,
-                y: gop_mode.info().resolution().1 as u64,
-            },
-            stride: gop_mode.info().stride() as u64,
-        });
     }
+    kernel_entry
 }
