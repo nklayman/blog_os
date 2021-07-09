@@ -21,6 +21,9 @@ struct FramebufferRes {
     x: u64,
     y: u64,
 }
+
+/// This struct is passed to the kernel by the bootloader
+/// and contains all the necessary information to use the GOP framebuffer
 #[repr(C)]
 pub struct FramebufferInfo {
     pointer: *mut u32,
@@ -29,6 +32,7 @@ pub struct FramebufferInfo {
     stride: u64,
 }
 
+/// The FramebufferInfo struct can be turned into this, which has implementations for writing text
 pub struct Framebuffer {
     info: FramebufferInfo,
     current_line: usize,
@@ -38,6 +42,8 @@ unsafe impl Send for Framebuffer {}
 
 pub static FRAMEBUFFER: OnceCell<Mutex<Framebuffer>> = OnceCell::uninit();
 
+/// This should be called at the start of the kernel to set the global Framebuffer object
+/// which is used by the print! and println! macros
 pub fn set_framebuffer(fb_info: FramebufferInfo) {
     let fb = Framebuffer::new(fb_info);
     fb.clear();
@@ -56,6 +62,8 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
+/// Just a wrapper to call the global framebuffer write_fmt
+/// Used by the print! and println! macros
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
@@ -63,6 +71,7 @@ pub fn _print(args: fmt::Arguments) {
 }
 
 impl Framebuffer {
+    /// Create a Framebuffer from the info passed to kernel by bootloader
     pub fn new(fb_info: FramebufferInfo) -> Self {
         Self {
             info: fb_info,
@@ -70,41 +79,29 @@ impl Framebuffer {
             current_col: 0,
         }
     }
-    pub fn _println(&mut self, text: &str) {
-        self.print(text);
-        self.current_line += 1;
-        self.current_col = 0;
-    }
+    /// Print a string to the current line and col positions, auto wraps
     pub fn print(&mut self, text: &str) {
-        let font_data = FONT.as_ptr();
-        let (header_size, bytes_per_glyph, height, width) = if FONT[0..2] == [0x36, 0x04] {
-            // PSFv1
-            (4, FONT[3] as usize, FONT[3] as u64, 8 as u64)
-        } else if FONT[0..4] == [0x72, 0xb5, 0x4a, 0x86] {
-            // PSFv2
-            let header: &PsfHeader = unsafe { &*(font_data as *const PsfHeader) };
-            (
-                header.headersize as usize,
-                header.bytesperglyph as usize,
-                header.height as u64,
-                header.width as u64,
-            )
-        } else {
-            // Unknown PSF version
-            panic!("This message is useless because we can't print")
-        };
+        let (header_size, bytes_per_glyph, height, width) = get_font_info();
         for c in text.bytes() {
+            // If text overflows line or if character is a newline, move down a line
             if c == b'\n' || self.current_col as u64 + width > self.info.stride {
                 self.current_line += 1;
                 self.current_col = 0;
+                // Don't write char if it's a newline
                 if c == b'\n' {
                     continue;
                 }
             }
+            // This is the location of the first byte of the glyph
             let char_pos = header_size + bytes_per_glyph * c as usize;
+            // Draw the font line by line, one pixel at a time
             for y in 0..height {
+                // Each byte corresponds to one line (this won't support wider fonts)
                 let line_data = FONT[char_pos + y as usize];
                 for x in 0..width {
+                    // Convert the byte to binary, and a 1 means draw a pixel, a 0 means don't
+                    // at each x position
+                    // This bitwise operation returns true if there is a 1 at the x coordinate
                     if line_data & (1 << (width - 1 - x)) != 0 {
                         self.draw_point(
                             x + self.current_col as u64,
@@ -113,6 +110,7 @@ impl Framebuffer {
                     }
                 }
             }
+            // Move the col position over by the width + 1 (for spacing between letters)
             self.current_col += (width + 1) as usize;
         }
     }
@@ -131,6 +129,7 @@ impl Framebuffer {
         }
     }
 
+    /// Draws a point at the specified x/y location, no support for colors (yet)
     pub fn draw_point(&self, x: u64, y: u64) {
         let fb = &self.info;
         let offset = x + y * fb.stride;
@@ -141,15 +140,34 @@ impl Framebuffer {
         }
     }
 
+    /// Clears out the framebuffer by writing it all to 0s
     pub fn clear(&self) {
         unsafe {
-            ptr::write_bytes(
-                self.info.pointer,
-                0,
-                (self.info.resolution.y * self.info.stride) as usize,
-            );
+            ptr::write_bytes(self.info.pointer, 0, self.info.size as usize);
         }
     }
+}
+
+/// Gets info about the fonts from the PSF header
+/// Supports PSF v1 and v2
+fn get_font_info() -> (usize, usize, u64, u64) {
+    let (header_size, bytes_per_glyph, height, width) = if FONT[0..2] == [0x36, 0x04] {
+        // PSFv1
+        (4, FONT[3] as usize, FONT[3] as u64, 8 as u64)
+    } else if FONT[0..4] == [0x72, 0xb5, 0x4a, 0x86] {
+        // PSFv2
+        let header: &PsfHeader = unsafe { &*(FONT.as_ptr() as *const PsfHeader) };
+        (
+            header.headersize as usize,
+            header.bytesperglyph as usize,
+            header.height as u64,
+            header.width as u64,
+        )
+    } else {
+        // Unknown PSF version
+        panic!("This message is useless because we can't print")
+    };
+    (header_size, bytes_per_glyph, height, width)
 }
 
 impl fmt::Write for Framebuffer {
@@ -158,68 +176,3 @@ impl fmt::Write for Framebuffer {
         Ok(())
     }
 }
-
-// pub fn draw_text(fb: &FrameBufferInfo, text: &str, line: usize) {
-//     let font_data = FONT.as_ptr();
-//     let (header_size, bytes_per_glyph, height, width) = if FONT[0..2] == [0x36, 0x04] {
-//         // PSFv1
-//         (4, FONT[3] as usize, FONT[3] as u64, 8 as u64)
-//     } else if FONT[0..4] == [0x72, 0xb5, 0x4a, 0x86] {
-//         // PSFv2
-//         let header: &PsfHeader = unsafe { &*(font_data as *const PsfHeader) };
-//         (
-//             header.headersize as usize,
-//             header.bytesperglyph as usize,
-//             header.height as u64,
-//             header.width as u64,
-//         )
-//     } else {
-//         // Unknown PSF version
-//         panic!("This message is useless because we can't print")
-//     };
-//     for (i, c) in text.bytes().enumerate() {
-//         let char_pos = header_size + bytes_per_glyph * c as usize;
-//         for y in 0..height {
-//             let line = FONT[char_pos + y as usize];
-//             for x in 0..width {
-//                 if line & (1 << (width - 1 - x)) != 0 {
-//                     draw_point(
-//                         &fb,
-//                         x + i as u64 * (width + 1),
-//                         y + line as u64 * (height + 1),
-//                     )
-//                 }
-//             }
-//         }
-//     }
-// }
-
-// pub fn draw_rect(fb: &FrameBufferInfo, x: u64, y: u64, width: u64, height: u64) {
-//     let mut cursor = (x, y);
-//     loop {
-//         draw_point(&fb, cursor.0, cursor.1);
-//         cursor.0 += 1;
-//         if cursor.0 == (x + width) {
-//             if cursor.1 == y + height {
-//                 break;
-//             }
-//             cursor.0 = x;
-//             cursor.1 += 1;
-//         }
-//     }
-// }
-
-// pub fn draw_point(fb: &FrameBufferInfo, x: u64, y: u64) {
-//     let offset = x + y * fb.stride;
-//     if offset < fb.size {
-//         unsafe {
-//             ptr::write(fb.pointer.add(offset as usize), 255);
-//         }
-//     }
-// }
-
-// pub fn clear(fb: &FrameBufferInfo) {
-//     unsafe {
-//         ptr::write_bytes(fb.pointer, 0, (fb.resolution.y * fb.stride) as usize);
-//     }
-// }
