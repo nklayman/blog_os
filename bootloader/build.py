@@ -273,10 +273,10 @@ def run_qemu():
     ansi_escape = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]')
 
     # Setup named pipes as a communication channel with QEMU's monitor
-    # monitor_input_path = f'{qemu_monitor_pipe}.in'
-    # os.mkfifo(monitor_input_path)
-    # monitor_output_path = f'{qemu_monitor_pipe}.out'
-    # os.mkfifo(monitor_output_path)
+    monitor_input_path = f'{qemu_monitor_pipe}.in'
+    os.mkfifo(monitor_input_path)
+    monitor_output_path = f'{qemu_monitor_pipe}.out'
+    os.mkfifo(monitor_output_path)
 
     # Start QEMU
     qemu = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, universal_newlines=True)
