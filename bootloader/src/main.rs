@@ -5,6 +5,8 @@
 extern crate alloc;
 use core::{mem, ptr, u8};
 
+mod elf;
+use elf::read_elf_header;
 use log::info;
 use uefi::proto::console::gop::{GraphicsOutput, Mode, PixelFormat};
 use uefi::proto::media::file::FileInfo;
@@ -120,16 +122,18 @@ fn load_kernel(bs: &BootServices) -> alloc::vec::Vec<u8> {
 /// and returns the kernel's entry point address
 unsafe fn copy_kernel_segments(kernel: alloc::vec::Vec<u8>) -> u64 {
     // Get info about the program segments from the header
-    let kernel_entry = *(kernel.as_ptr().offset(0x18) as *const u64);
-    let program_headers_offset = *(kernel.as_ptr().offset(0x20) as *const u64);
-    let program_headers = kernel.as_ptr().add(program_headers_offset as usize);
-    let entry_size = *(kernel.as_ptr().offset(0x36) as *const u16);
-    let entry_count = *(kernel.as_ptr().offset(0x38) as *const u16);
+    let header = read_elf_header(&kernel);
+    let kernel_entry = header.e_entry as u64;
+    let program_headers_offset = header.e_phoff;
+    let entry_size = header.e_phentsize;
+    let entry_count = header.e_phnum;
+
+    let program_headers_ptr = kernel.as_ptr().add(program_headers_offset as usize);
 
     // Load each entry
     for i in 0..entry_count {
         // Get a pointer to the beginning of the header
-        let header_ptr = program_headers.add((i * entry_size).into());
+        let header_ptr = program_headers_ptr.add((i * entry_size).into());
         // If the segment type is 1, it should be loaded
         // Other segments can be ignored I think
         let segment_type = *(header_ptr as *const u32);
@@ -143,7 +147,7 @@ unsafe fn copy_kernel_segments(kernel: alloc::vec::Vec<u8>) -> u64 {
             // The amount of memory that should be allocated for the segment
             let size_mem = *(header_ptr.offset(0x28) as *const u64);
             info!(
-                "Writing segment of size {:X} from {:X} to {:X}",
+                "Writing segment of size {} from {:X} to {:X}",
                 size_mem, data_offset, mem_addr
             );
             // Clear out space for the segment
