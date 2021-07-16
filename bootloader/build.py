@@ -38,6 +38,7 @@ SETTINGS = {
     # or `*-pflash.raw` (for AArch64).
     # `find_ovmf` function will try to find one if this isn't specified.
     'ovmf_dir': None,
+    'debug': False,
 }
 
 # Path to target directory. If None, it will be initialized with information
@@ -261,6 +262,9 @@ def run_qemu():
     if SETTINGS['headless']:
         # Do not attach a window to QEMU's display
         qemu_flags.extend(['-display', 'none'])
+    if SETTINGS['debug']:
+        # Enable gdb to attach to QEMU's process
+        qemu_flags.extend(['-s', '-S'])
 
     qemu_binary = SETTINGS['qemu_binary'][arch]
     cmd = [qemu_binary] + qemu_flags
@@ -371,6 +375,9 @@ def main():
     parser.add_argument('--ci', help='disables some tests which currently break CI',
                         action='store_true')
 
+    parser.add_argument('--debug', '-d', help='enable gdb debugging',
+                        action='store_true')
+
     opts = parser.parse_args()
 
     SETTINGS['arch'] = opts.target
@@ -379,6 +386,7 @@ def main():
     SETTINGS['headless'] = opts.headless
     SETTINGS['config'] = 'release' if opts.release else 'debug'
     SETTINGS['ci'] = opts.ci
+    SETTINGS['debug'] = opts.debug
 
     verb = opts.verb
 

@@ -1,5 +1,5 @@
-from bootloader.build import run_qemu
+from bootloader.build import main
 import os
 os.system("cargo build")
 os.chdir("./bootloader")
-run_qemu()
+main()
